@@ -1,0 +1,17 @@
+[project]
+name = "bmo-financial-insights"
+version = "0.1.0"
+description = "RAG-powered financial document analysis tool for BMO 2025 Annual Report"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.45.0",
+    "openai>=1.30.0",
+    "chromadb>=0.5.0",
+    "pymupdf>=1.24.0",
+    "sentence-transformers>=3.0.0",
+    "pandas>=2.0.0",
+    "requests>=2.31.0",
+]
+
+[tool.setuptools]
+py-modules = []
