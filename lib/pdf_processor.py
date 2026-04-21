@@ -19,9 +19,17 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 PDF_PATH = DATA_DIR / "bmo_ar2025_MDA.pdf"
 CHUNKS_CACHE_PATH = DATA_DIR / "chunks.json"
 
-# Font size thresholds for heading detection (tuned for BMO report)
-HEADING_MIN_FONT_SIZE = 11.0
-SUBHEADING_MIN_FONT_SIZE = 9.5
+# Font size thresholds calibrated for BMO 2025 MDA report:
+# 24pt non-bold = major section titles ("About BMO", "Corporate Events")
+# 14pt non-bold = section headings ("Our Strategic Priorities", "Efficiency Ratio")
+# 9pt bold = "MD&A" page markers (skip these)
+# 8.2pt bold = subheadings ("Credit Risk", "TABLE 1")
+# 7.5pt = body text
+HEADING_MIN_FONT_SIZE = 12.0
+SUBHEADING_MIN_FONT_SIZE = 8.0
+
+# Page marker text to ignore as headings
+IGNORE_HEADINGS = {"MD&A", "md&a"}
 
 # Minimum chunk length to avoid noise
 MIN_CHUNK_LENGTH = 50
@@ -36,14 +44,36 @@ def download_pdf() -> Path:
     if PDF_PATH.exists():
         return PDF_PATH
 
-    response = requests.get(PDF_URL, timeout=60)
-    response.raise_for_status()
-    PDF_PATH.write_bytes(response.content)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    for attempt in range(3):
+        try:
+            response = requests.get(PDF_URL, timeout=120, headers=headers, stream=True)
+            response.raise_for_status()
+            PDF_PATH.write_bytes(response.content)
+            return PDF_PATH
+        except requests.exceptions.ReadTimeout:
+            if attempt == 2:
+                raise
+            continue
+
     return PDF_PATH
 
 
 def _classify_block(block: dict, median_font_size: float) -> str:
-    """Classify a text block as heading, subheading, or body text."""
+    """Classify a text block as heading, subheading, or body text.
+
+    BMO PDF structure:
+      - 14pt+ (bold or not) → heading (major sections)
+      - 8.0–12pt bold → subheading (sub-sections, table labels)
+      - 7.5pt body text
+      - 9pt bold "MD&A" markers → ignored
+    """
     if block.get("type") == 1:  # image block
         return "image"
 
@@ -55,21 +85,38 @@ def _classify_block(block: dict, median_font_size: float) -> str:
     sizes = []
     bold_count = 0
     total_spans = 0
+    full_text = ""
     for line in lines:
         for span in line.get("spans", []):
             sizes.append(span["size"])
             total_spans += 1
+            full_text += span["text"]
             if span["flags"] & 2**4:  # bold flag
                 bold_count += 1
 
     if not sizes:
         return "body"
 
+    # Skip known page markers like "MD&A"
+    stripped = full_text.strip()
+    if stripped in IGNORE_HEADINGS:
+        return "body"
+    # Normalize curly apostrophes for comparison
+    norm = stripped.replace("\u2019", "'").replace("\u2018", "'")
+    # Skip running page headers like "MANAGEMENT'S DISCUSSION AND ANALYSIS"
+    if norm.startswith("MANAGEMENT'S DISCUSSION AND ANALYSIS"):
+        # Only skip if it's JUST the header; keep if it has a real title appended
+        remainder = norm.replace("MANAGEMENT'S DISCUSSION AND ANALYSIS", "").strip()
+        if not remainder:
+            return "body"
+
     avg_size = sum(sizes) / len(sizes)
     is_mostly_bold = bold_count > total_spans * 0.5
 
-    if avg_size >= HEADING_MIN_FONT_SIZE and is_mostly_bold:
+    # Large text (14pt+) = heading regardless of bold
+    if avg_size >= HEADING_MIN_FONT_SIZE:
         return "heading"
+    # Bold text above subheading threshold = subheading
     elif avg_size >= SUBHEADING_MIN_FONT_SIZE and is_mostly_bold:
         return "subheading"
     return "body"
@@ -154,6 +201,10 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
     current_heading = "Document Start"
     current_subheading = ""
 
+    # Prefix to strip from headings that contain a real title after it
+    MDA_PREFIX = "MANAGEMENT'S DISCUSSION AND ANALYSIS"
+    MDA_PREFIX_CURLY = "MANAGEMENT\u2019S DISCUSSION AND ANALYSIS"
+
     for page_idx, page in enumerate(doc):
         page_num = page_idx + 1
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
@@ -189,6 +240,17 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
                         )
 
                 current_heading = block_text.strip()
+                # Clean up MDA prefix from headings like
+                # "MANAGEMENT'S DISCUSSION AND ANALYSIS About BMO"
+                for prefix in (MDA_PREFIX, MDA_PREFIX_CURLY):
+                    if prefix in current_heading:
+                        remainder = current_heading.replace(prefix, "").strip()
+                        if remainder:
+                            current_heading = remainder
+                        else:
+                            # Pure header with no real title — don't treat as heading
+                            continue
+                        break
                 current_subheading = ""
                 page_text_buffer = ""
                 page_content_type = "text"

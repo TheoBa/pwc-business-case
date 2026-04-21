@@ -148,7 +148,7 @@ if not df.empty:
         column_config={
             "Preview": st.column_config.TextColumn("Preview", width="large"),
             "Length": st.column_config.ProgressColumn(
-                "Length", min_value=0, max_value=df["Length"].max()
+                "Length", min_value=0, max_value=int(df["Length"].max())
             ),
         },
     )
