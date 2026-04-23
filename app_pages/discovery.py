@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from lib.pdf_processor import get_all_headings, get_headings
+from lib.pdf_processor import get_all_headings, get_headings, get_all_time_periods
 
 st.title(":material/search: Discovery")
 st.caption("Explore the structure and contents of BMO's 2025 Management Discussion & Analysis report.")
@@ -21,7 +21,8 @@ with st.sidebar:
 
     all_headings = get_all_headings(chunks)
     top_headings = get_headings(chunks)
-    content_types = sorted({c["content_type"] for c in chunks})
+    chunk_types = sorted({c.get("chunk_type", c.get("content_type", "text")) for c in chunks})
+    time_periods = get_all_time_periods(chunks)
     page_numbers = sorted({c["page_number"] for c in chunks})
 
     selected_heading = st.selectbox(
@@ -31,7 +32,13 @@ with st.sidebar:
 
     selected_type = st.selectbox(
         "Content type",
-        ["All types"] + content_types,
+        ["All types"] + chunk_types,
+    )
+
+    selected_periods = st.multiselect(
+        "Time period",
+        time_periods,
+        help="Filter chunks mentioning specific time periods",
     )
 
     page_range = st.slider(
@@ -44,9 +51,14 @@ with st.sidebar:
 # ── Apply filters ──
 filtered = chunks
 if selected_heading != "All sections":
-    filtered = [c for c in filtered if c["heading"].startswith(selected_heading)]
+    filtered = [c for c in filtered if c.get("heading_top", c["heading"].split(" > ")[0]) == selected_heading]
 if selected_type != "All types":
-    filtered = [c for c in filtered if c["content_type"] == selected_type]
+    filtered = [c for c in filtered if c.get("chunk_type", c.get("content_type", "text")) == selected_type]
+if selected_periods:
+    def _has_period(chunk):
+        tp = chunk.get("time_period_str", "")
+        return any(p in tp for p in selected_periods)
+    filtered = [c for c in filtered if _has_period(c)]
 filtered = [c for c in filtered if page_range[0] <= c["page_number"] <= page_range[1]]
 
 # ── KPI metrics ──
@@ -56,7 +68,7 @@ with st.container(horizontal=True):
     st.metric("Sections", len(top_headings), border=True)
     st.metric(
         "Tables detected",
-        sum(1 for c in chunks if c["content_type"] == "table"),
+        sum(1 for c in chunks if c.get("chunk_type", c.get("content_type", "")) == "table"),
         border=True,
     )
 
@@ -75,7 +87,7 @@ with col1:
     with st.container(border=True):
         st.subheader("Content type distribution")
         type_counts = pd.DataFrame(
-            [{"Type": c["content_type"]} for c in filtered]
+            [{"Type": c.get("chunk_type", c.get("content_type", "text"))} for c in filtered]
         )
         if not type_counts.empty:
             st.bar_chart(type_counts["Type"].value_counts())
@@ -85,7 +97,7 @@ with col2:
         st.subheader("Chunks per section (top 15)")
         heading_counts = {}
         for c in filtered:
-            top = c["heading"].split(" > ")[0]
+            top = c.get("heading_top") or c["heading"].split(" > ")[0]
             heading_counts[top] = heading_counts.get(top, 0) + 1
         if heading_counts:
             hc_df = (
@@ -130,8 +142,10 @@ st.subheader("All chunks")
 df = pd.DataFrame(
     [
         {
-            "Heading": c["heading"],
-            "Type": c["content_type"],
+            "Section": c.get("heading_top", c["heading"].split(" > ")[0]),
+            "Sub-section": c.get("heading_sub", ""),
+            "Type": c.get("chunk_type", c.get("content_type", "text")),
+            "Time Period": c.get("time_period_str", ""),
             "Page": c["page_number"],
             "Preview": c["text"][:150] + "..." if len(c["text"]) > 150 else c["text"],
             "Length": len(c["text"]),

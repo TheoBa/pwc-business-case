@@ -29,7 +29,7 @@ graph LR
     G -->|Yes| E
     G -->|No| H[Direct LLM Call]
     G -->|Ambiguous| I[Clarification Request]
-    E -->|Context + Citations| J[GPT-4o]
+    E -->|Context + Citations| J[Llama 3.1 via Ollama]
     H --> J
     J -->|Streaming| K[Streamlit Chat UI]
     I --> K
@@ -63,7 +63,7 @@ graph TB
     end
 
     subgraph "LLM"
-        H[GPT-4o<br/>Azure OpenAI / OpenAI API]
+        H[LLM Service<br/>Azure OpenAI / Self-hosted Ollama]
     end
 
     subgraph "Monitoring"
@@ -104,7 +104,7 @@ with col1:
         st.subheader("Embedding model")
         st.markdown("""
         - **Default**: `all-MiniLM-L6-v2` (sentence-transformers) — local, no API key, 384-dim
-        - **Production upgrade**: OpenAI `text-embedding-3-small` for higher quality
+        - **Production upgrade**: OpenAI `text-embedding-3-small` or Ollama embeddings for higher quality
         - **Trade-off**: local model enables zero-config demo; cloud model offers better semantic matching
         """)
 
@@ -120,7 +120,8 @@ with col2:
     with st.container(border=True):
         st.subheader("LLM & RAG approach")
         st.markdown("""
-        - **Model**: GPT-4o for best reasoning on financial data
+        - **Model**: Llama 3.1 8B via Ollama (fully offline, no API costs)
+        - **Production alternative**: GPT-4o or Claude for stronger reasoning on financial data
         - **Intent detection**: classifies queries as knowledge-base, general, or ambiguous
         - **Citation enforcement**: system prompt requires `[Page X, Section: Y]` format
         - **Streaming**: token-by-token delivery for responsive UX
@@ -141,7 +142,7 @@ with col1:
         - MRR (Mean Reciprocal Rank): position of first relevant result
 
         **Answer quality:**
-        - LLM-as-judge: GPT-4o rates answer faithfulness, relevance, and completeness
+        - LLM-as-judge: dedicated evaluation model rates answer faithfulness, relevance, and completeness
         - Citation accuracy: verify cited pages actually contain the stated information
         - Golden dataset: 50+ curated Q&A pairs from the BMO MDA for regression testing
         """)
@@ -200,4 +201,4 @@ with st.container(border=True):
         st.markdown("- ChromaDB (vectors)\n- Local file cache")
     with cols[3]:
         st.markdown("**AI/LLM**")
-        st.markdown("- OpenAI GPT-4o\n- RAG pipeline")
+        st.markdown("- Ollama + Llama 3.1\n- RAG pipeline")

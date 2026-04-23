@@ -9,7 +9,7 @@ from lib.llm_client import (
     stream_general_response,
     stream_rag_response,
 )
-from lib.pdf_processor import get_headings
+from lib.pdf_processor import get_headings, get_all_time_periods
 
 st.title(":material/chat: Problem solving")
 st.caption(
@@ -24,6 +24,7 @@ if not chunks:
 
 # ── Sidebar: section filter ──
 top_headings = get_headings(chunks)
+time_periods = get_all_time_periods(chunks)
 
 with st.sidebar:
     st.header("Query scope")
@@ -31,6 +32,12 @@ with st.sidebar:
         "Filter by section",
         ["All sections"] + top_headings,
         help="Scope the search to a specific document section",
+    )
+
+    time_period_filter = st.selectbox(
+        "Filter by time period",
+        ["All periods"] + time_periods,
+        help="Scope the search to a specific time period",
     )
 
     st.divider()
@@ -41,6 +48,7 @@ with st.sidebar:
     st.button("Clear chat", on_click=clear_chat, icon=":material/delete:")
 
 active_filter = None if heading_filter == "All sections" else heading_filter
+active_time_period = None if time_period_filter == "All periods" else time_period_filter
 
 # ── Suggestion chips (before first message) ──
 SUGGESTIONS = {
@@ -72,9 +80,11 @@ for i, msg in enumerate(st.session_state.messages):
         if msg["role"] == "assistant" and msg.get("sources"):
             with st.expander(f":material/source: {len(msg['sources'])} sources cited"):
                 for src in msg["sources"]:
+                    chunk_type = src.get('chunk_type', src.get('content_type', 'text'))
+                    time_info = f" | Period: {src['time_period_str']}" if src.get('time_period_str') else ""
                     st.markdown(
                         f"**Page {src['page_number']}** — {src['heading']} "
-                        f"({src['content_type']})"
+                        f"({chunk_type}{time_info})"
                     )
                     st.caption(src["text"][:200] + "..." if len(src["text"]) > 200 else src["text"])
                     st.divider()
@@ -125,19 +135,31 @@ if prompt := st.chat_input("Ask a question about BMO's 2025 Annual Report..."):
                 )
             )
 
-            # Get sources from the last RAG call
+            # Get sources and query plan from the last RAG call
             sources = getattr(stream_rag_response, "_last_sources", [])
+            query_plan = getattr(stream_rag_response, "_last_query_plan", None)
             st.session_state.messages.append(
-                {"role": "assistant", "content": response, "sources": sources}
+                {"role": "assistant", "content": response, "sources": sources, "query_plan": query_plan}
             )
+
+            # Show query plan
+            if query_plan and query_plan.get("filters"):
+                active_filters = {k: v for k, v in query_plan["filters"].items() if v}
+                if active_filters:
+                    with st.expander(":material/tune: Query plan"):
+                        st.markdown(f"**Search text:** {query_plan.get('search_text', prompt)}")
+                        for key, val in active_filters.items():
+                            st.markdown(f"**{key}:** {val}")
 
             # Show sources
             if sources:
                 with st.expander(f":material/source: {len(sources)} sources cited"):
                     for src in sources:
+                        chunk_type = src.get('chunk_type', src.get('content_type', 'text'))
+                        time_info = f" | Period: {src['time_period_str']}" if src.get('time_period_str') else ""
                         st.markdown(
                             f"**Page {src['page_number']}** — {src['heading']} "
-                            f"({src['content_type']})"
+                            f"({chunk_type}{time_info})"
                         )
                         st.caption(
                             src["text"][:200] + "..."
