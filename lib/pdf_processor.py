@@ -1,41 +1,52 @@
 from __future__ import annotations
 """PDF processing module for BMO Annual Report.
 
-Downloads the PDF, extracts text by page, detects headings via font analysis,
-and segments content into tagged chunks for vector indexing.
+Downloads the PDF, extracts structured elements via Unstructured.io,
+and segments content into tagged chunks with rich metadata for vector indexing.
 """
 
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
 
-import fitz  # PyMuPDF
 import requests
+from unstructured.partition.pdf import partition_pdf
+from unstructured.documents.elements import (
+    Title,
+    NarrativeText,
+    Table,
+    ListItem,
+    Image,
+    FigureCaption,
+    Header,
+)
 
 PDF_URL = "https://www.bmo.com/ir/archive/en/bmo_ar2025_MDA.pdf"
 DATA_DIR = Path(__file__).parent.parent / "data"
 PDF_PATH = DATA_DIR / "bmo_ar2025_MDA.pdf"
 CHUNKS_CACHE_PATH = DATA_DIR / "chunks.json"
+SOURCE_FILE = "bmo_ar2025_MDA.pdf"
 
-# Font size thresholds calibrated for BMO 2025 MDA report:
-# 24pt non-bold = major section titles ("About BMO", "Corporate Events")
-# 14pt non-bold = section headings ("Our Strategic Priorities", "Efficiency Ratio")
-# 9pt bold = "MD&A" page markers (skip these)
-# 8.2pt bold = subheadings ("Credit Risk", "TABLE 1")
-# 7.5pt = body text
-HEADING_MIN_FONT_SIZE = 12.0
-SUBHEADING_MIN_FONT_SIZE = 8.0
-
-# Page marker text to ignore as headings
-IGNORE_HEADINGS = {"MD&A", "md&a"}
+# Schema version — bump this to force re-index when metadata schema changes
+SCHEMA_VERSION = 2
 
 # Minimum chunk length to avoid noise
 MIN_CHUNK_LENGTH = 50
 
 # Maximum chunk length before splitting
 MAX_CHUNK_LENGTH = 2000
+
+# Regex patterns for time period extraction
+_TIME_PERIOD_PATTERNS = [
+    re.compile(r"\bFY\s?(\d{4})\b", re.IGNORECASE),        # FY2023, FY 2023
+    re.compile(r"\bQ([1-4])\s+(\d{4})\b"),                   # Q3 2023
+    re.compile(r"\bQ([1-4])(\d{4})\b"),                       # Q32023
+    re.compile(r"\b(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(\d{4})\b", re.IGNORECASE),
+    re.compile(r"\b(20[1-3]\d)\b"),                           # standalone year 2010-2039
+]
+
+_QUARTER_WORD_MAP = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
 
 
 def download_pdf() -> Path:
@@ -65,82 +76,46 @@ def download_pdf() -> Path:
     return PDF_PATH
 
 
-def _classify_block(block: dict, median_font_size: float) -> str:
-    """Classify a text block as heading, subheading, or body text.
+def _extract_time_periods(text: str) -> list[str]:
+    """Extract time period references from text using regex.
 
-    BMO PDF structure:
-      - 14pt+ (bold or not) → heading (major sections)
-      - 8.0–12pt bold → subheading (sub-sections, table labels)
-      - 7.5pt body text
-      - 9pt bold "MD&A" markers → ignored
+    Returns deduplicated list like ["FY2023", "Q3 2023", "2024"].
     """
-    if block.get("type") == 1:  # image block
+    periods = set()
+
+    # FY patterns
+    for m in _TIME_PERIOD_PATTERNS[0].finditer(text):
+        periods.add(f"FY{m.group(1)}")
+
+    # Q + year patterns
+    for pattern in _TIME_PERIOD_PATTERNS[1:3]:
+        for m in pattern.finditer(text):
+            periods.add(f"Q{m.group(1)} {m.group(2)}")
+
+    # Quarter word patterns (first quarter of 2023)
+    for m in _TIME_PERIOD_PATTERNS[3].finditer(text):
+        q = _QUARTER_WORD_MAP[m.group(1).lower()]
+        periods.add(f"Q{q} {m.group(2)}")
+
+    # Standalone years
+    for m in _TIME_PERIOD_PATTERNS[4].finditer(text):
+        periods.add(m.group(1))
+
+    return sorted(periods)
+
+
+def _map_element_type(element) -> str:
+    """Map an Unstructured element to our chunk_type schema."""
+    if isinstance(element, Table):
+        return "table"
+    elif isinstance(element, ListItem):
+        return "list"
+    elif isinstance(element, Image):
         return "image"
-
-    lines = block.get("lines", [])
-    if not lines:
-        return "body"
-
-    # Get the dominant font size and flags for this block
-    sizes = []
-    bold_count = 0
-    total_spans = 0
-    full_text = ""
-    for line in lines:
-        for span in line.get("spans", []):
-            sizes.append(span["size"])
-            total_spans += 1
-            full_text += span["text"]
-            if span["flags"] & 2**4:  # bold flag
-                bold_count += 1
-
-    if not sizes:
-        return "body"
-
-    # Skip known page markers like "MD&A"
-    stripped = full_text.strip()
-    if stripped in IGNORE_HEADINGS:
-        return "body"
-    # Normalize curly apostrophes for comparison
-    norm = stripped.replace("\u2019", "'").replace("\u2018", "'")
-    # Skip running page headers like "MANAGEMENT'S DISCUSSION AND ANALYSIS"
-    if norm.startswith("MANAGEMENT'S DISCUSSION AND ANALYSIS"):
-        # Only skip if it's JUST the header; keep if it has a real title appended
-        remainder = norm.replace("MANAGEMENT'S DISCUSSION AND ANALYSIS", "").strip()
-        if not remainder:
-            return "body"
-
-    avg_size = sum(sizes) / len(sizes)
-    is_mostly_bold = bold_count > total_spans * 0.5
-
-    # Large text (14pt+) = heading regardless of bold
-    if avg_size >= HEADING_MIN_FONT_SIZE:
-        return "heading"
-    # Bold text above subheading threshold = subheading
-    elif avg_size >= SUBHEADING_MIN_FONT_SIZE and is_mostly_bold:
-        return "subheading"
-    return "body"
-
-
-def _extract_block_text(block: dict) -> str:
-    """Extract plain text from a block dict."""
-    if block.get("type") == 1:
-        return "[Image]"
-    lines = block.get("lines", [])
-    text_parts = []
-    for line in lines:
-        spans_text = " ".join(span["text"] for span in line.get("spans", []))
-        text_parts.append(spans_text)
-    return " ".join(text_parts).strip()
-
-
-def _detect_table_heuristic(text: str) -> bool:
-    """Simple heuristic to detect if a text block is likely a table row."""
-    # Tables tend to have multiple numbers separated by spaces/tabs
-    num_count = len(re.findall(r"\b[\d,]+\.?\d*\b", text))
-    has_dollar = "$" in text
-    # If there are 3+ numbers in a single block, likely a table
-    return (num_count >= 3) or (has_dollar and num_count >= 2)
+    elif isinstance(element, FigureCaption):
+        return "chart_caption"
+    else:
+        return "text"
 
 
 def _split_long_chunk(text: str, max_length: int = MAX_CHUNK_LENGTH) -> list[str]:
@@ -165,165 +140,173 @@ def _split_long_chunk(text: str, max_length: int = MAX_CHUNK_LENGTH) -> list[str
     return chunks if chunks else [text]
 
 
-def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
-    """Extract structured chunks from the PDF with heading hierarchy and metadata.
+def _is_cache_valid() -> bool:
+    """Check if chunks cache exists and matches current schema version."""
+    if not CHUNKS_CACHE_PATH.exists():
+        return False
+    try:
+        with open(CHUNKS_CACHE_PATH) as f:
+            data = json.load(f)
+        if not data:
+            return False
+        first = data[0]
+        required_fields = {"source_file", "chunk_type", "heading_top", "heading_sub", "time_period_str"}
+        if not required_fields.issubset(first.keys()):
+            return False
+        if first.get("_schema_version") != SCHEMA_VERSION:
+            return False
+        return True
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return False
 
-    Returns a list of dicts:
-        {
-            "id": str,           # unique chunk id
-            "text": str,         # chunk content
-            "heading": str,      # section heading (e.g., "Risk Management > Credit Risk")
-            "content_type": str, # "text", "table", or "image"
-            "page_number": int,  # 1-indexed page number
-        }
+
+def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
+    """Extract structured chunks from the PDF with rich metadata.
+
+    Returns a list of dicts with keys: id, text, source_file, page_number,
+    chunk_type, heading, heading_top, heading_sub, time_period_str, _schema_version.
     """
-    if CHUNKS_CACHE_PATH.exists():
+    if _is_cache_valid():
         with open(CHUNKS_CACHE_PATH) as f:
             return json.load(f)
 
     if pdf_path is None:
         pdf_path = download_pdf()
 
-    doc = fitz.open(pdf_path)
+    # Use Unstructured.io to partition the PDF with layout detection
+    elements = partition_pdf(
+        filename=str(pdf_path),
+        strategy="fast",
+        include_page_breaks=False,
+    )
+
     chunks = []
-
-    # First pass: compute median font size across document
-    all_sizes = []
-    for page in doc:
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-        for block in blocks:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    all_sizes.append(span["size"])
-    median_font_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 10.0
-
-    # Second pass: extract and classify
     current_heading = "Document Start"
     current_subheading = ""
 
-    # Prefix to strip from headings that contain a real title after it
-    MDA_PREFIX = "MANAGEMENT'S DISCUSSION AND ANALYSIS"
-    MDA_PREFIX_CURLY = "MANAGEMENT\u2019S DISCUSSION AND ANALYSIS"
+    # Buffer for accumulating body text under a heading
+    text_buffer = ""
+    buffer_chunk_type = "text"
+    buffer_page = 1
 
-    for page_idx, page in enumerate(doc):
-        page_num = page_idx + 1
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-        page_text_buffer = ""
-        page_content_type = "text"
-
-        for block in blocks:
-            block_type = _classify_block(block, median_font_size)
-            block_text = _extract_block_text(block)
-
-            if not block_text.strip():
-                continue
-
-            if block_type == "heading":
-                # Flush previous buffer
-                if page_text_buffer.strip() and len(page_text_buffer.strip()) >= MIN_CHUNK_LENGTH:
-                    heading_path = current_heading
-                    if current_subheading:
-                        heading_path = f"{current_heading} > {current_subheading}"
-
-                    for piece in _split_long_chunk(page_text_buffer.strip()):
-                        chunk_id = hashlib.md5(
-                            f"{heading_path}:{page_num}:{piece[:50]}".encode()
-                        ).hexdigest()
-                        chunks.append(
-                            {
-                                "id": chunk_id,
-                                "text": piece,
-                                "heading": heading_path,
-                                "content_type": page_content_type,
-                                "page_number": page_num,
-                            }
-                        )
-
-                current_heading = block_text.strip()
-                # Clean up MDA prefix from headings like
-                # "MANAGEMENT'S DISCUSSION AND ANALYSIS About BMO"
-                for prefix in (MDA_PREFIX, MDA_PREFIX_CURLY):
-                    if prefix in current_heading:
-                        remainder = current_heading.replace(prefix, "").strip()
-                        if remainder:
-                            current_heading = remainder
-                        else:
-                            # Pure header with no real title — don't treat as heading
-                            continue
-                        break
-                current_subheading = ""
-                page_text_buffer = ""
-                page_content_type = "text"
-
-            elif block_type == "subheading":
-                # Flush buffer under previous subheading
-                if page_text_buffer.strip() and len(page_text_buffer.strip()) >= MIN_CHUNK_LENGTH:
-                    heading_path = current_heading
-                    if current_subheading:
-                        heading_path = f"{current_heading} > {current_subheading}"
-
-                    for piece in _split_long_chunk(page_text_buffer.strip()):
-                        chunk_id = hashlib.md5(
-                            f"{heading_path}:{page_num}:{piece[:50]}".encode()
-                        ).hexdigest()
-                        chunks.append(
-                            {
-                                "id": chunk_id,
-                                "text": piece,
-                                "heading": heading_path,
-                                "content_type": page_content_type,
-                                "page_number": page_num,
-                            }
-                        )
-
-                current_subheading = block_text.strip()
-                page_text_buffer = ""
-                page_content_type = "text"
-
-            elif block_type == "image":
-                heading_path = current_heading
-                if current_subheading:
-                    heading_path = f"{current_heading} > {current_subheading}"
-                chunk_id = hashlib.md5(
-                    f"img:{heading_path}:{page_num}".encode()
-                ).hexdigest()
-                chunks.append(
-                    {
-                        "id": chunk_id,
-                        "text": f"[Image on page {page_num}]",
-                        "heading": heading_path,
-                        "content_type": "image",
-                        "page_number": page_num,
-                    }
-                )
-
-            else:
-                # Body text — detect tables
-                if _detect_table_heuristic(block_text):
-                    page_content_type = "table"
-                page_text_buffer += " " + block_text
-
-        # Flush remaining buffer at end of page
-        if page_text_buffer.strip() and len(page_text_buffer.strip()) >= MIN_CHUNK_LENGTH:
+    def _flush_buffer():
+        nonlocal text_buffer, buffer_chunk_type, buffer_page
+        if text_buffer.strip() and len(text_buffer.strip()) >= MIN_CHUNK_LENGTH:
             heading_path = current_heading
             if current_subheading:
                 heading_path = f"{current_heading} > {current_subheading}"
 
-            for piece in _split_long_chunk(page_text_buffer.strip()):
-                chunk_id = hashlib.md5(
-                    f"{heading_path}:{page_num}:{piece[:50]}".encode()
-                ).hexdigest()
-                chunks.append(
-                    {
-                        "id": chunk_id,
-                        "text": piece,
-                        "heading": heading_path,
-                        "content_type": page_content_type,
-                        "page_number": page_num,
-                    }
-                )
+            heading_top = heading_path.split(" > ")[0]
+            heading_sub = heading_path.split(" > ")[-1] if " > " in heading_path else ""
+            time_periods = _extract_time_periods(text_buffer)
 
-    doc.close()
+            for piece in _split_long_chunk(text_buffer.strip()):
+                chunk_id = hashlib.md5(
+                    f"{heading_path}:{buffer_page}:{piece[:50]}".encode()
+                ).hexdigest()
+                chunks.append({
+                    "id": chunk_id,
+                    "text": piece,
+                    "source_file": SOURCE_FILE,
+                    "page_number": buffer_page,
+                    "chunk_type": buffer_chunk_type,
+                    "heading": heading_path,
+                    "heading_top": heading_top,
+                    "heading_sub": heading_sub,
+                    "time_period_str": ",".join(time_periods),
+                    "_schema_version": SCHEMA_VERSION,
+                })
+
+        text_buffer = ""
+        buffer_chunk_type = "text"
+
+    for element in elements:
+        page_num = element.metadata.page_number or 1
+        element_text = str(element).strip()
+
+        if not element_text:
+            continue
+
+        if isinstance(element, Title):
+            _flush_buffer()
+
+            depth = getattr(element.metadata, "category_depth", None)
+            if depth is not None and depth > 0:
+                current_subheading = element_text
+            else:
+                current_heading = element_text
+                current_subheading = ""
+
+            buffer_page = page_num
+
+        elif isinstance(element, Header):
+            # Running headers — skip
+            continue
+
+        elif isinstance(element, (Table, Image, FigureCaption)):
+            _flush_buffer()
+
+            chunk_type = _map_element_type(element)
+            heading_path = current_heading
+            if current_subheading:
+                heading_path = f"{current_heading} > {current_subheading}"
+
+            heading_top = heading_path.split(" > ")[0]
+            heading_sub = heading_path.split(" > ")[-1] if " > " in heading_path else ""
+
+            display_text = element_text if chunk_type != "image" else f"[Image on page {page_num}]"
+            time_periods = _extract_time_periods(display_text)
+
+            chunk_id = hashlib.md5(
+                f"{chunk_type}:{heading_path}:{page_num}:{display_text[:50]}".encode()
+            ).hexdigest()
+            chunks.append({
+                "id": chunk_id,
+                "text": display_text,
+                "source_file": SOURCE_FILE,
+                "page_number": page_num,
+                "chunk_type": chunk_type,
+                "heading": heading_path,
+                "heading_top": heading_top,
+                "heading_sub": heading_sub,
+                "time_period_str": ",".join(time_periods),
+                "_schema_version": SCHEMA_VERSION,
+            })
+
+        elif isinstance(element, ListItem):
+            _flush_buffer()
+
+            heading_path = current_heading
+            if current_subheading:
+                heading_path = f"{current_heading} > {current_subheading}"
+
+            heading_top = heading_path.split(" > ")[0]
+            heading_sub = heading_path.split(" > ")[-1] if " > " in heading_path else ""
+            time_periods = _extract_time_periods(element_text)
+
+            chunk_id = hashlib.md5(
+                f"list:{heading_path}:{page_num}:{element_text[:50]}".encode()
+            ).hexdigest()
+            chunks.append({
+                "id": chunk_id,
+                "text": element_text,
+                "source_file": SOURCE_FILE,
+                "page_number": page_num,
+                "chunk_type": "list",
+                "heading": heading_path,
+                "heading_top": heading_top,
+                "heading_sub": heading_sub,
+                "time_period_str": ",".join(time_periods),
+                "_schema_version": SCHEMA_VERSION,
+            })
+
+        else:
+            # NarrativeText and other text elements — buffer them
+            buffer_page = page_num
+            text_buffer += " " + element_text
+
+    # Flush remaining buffer
+    _flush_buffer()
 
     # Cache chunks to disk
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -338,7 +321,7 @@ def get_headings(chunks: list[dict]) -> list[str]:
     seen = set()
     headings = []
     for chunk in chunks:
-        top = chunk["heading"].split(" > ")[0]
+        top = chunk.get("heading_top") or chunk["heading"].split(" > ")[0]
         if top not in seen:
             seen.add(top)
             headings.append(top)
@@ -355,3 +338,16 @@ def get_all_headings(chunks: list[dict]) -> list[str]:
             seen.add(h)
             headings.append(h)
     return headings
+
+
+def get_all_time_periods(chunks: list[dict]) -> list[str]:
+    """Return all unique time periods across all chunks."""
+    periods = set()
+    for chunk in chunks:
+        tp = chunk.get("time_period_str", "")
+        if tp:
+            for p in tp.split(","):
+                p = p.strip()
+                if p:
+                    periods.add(p)
+    return sorted(periods)

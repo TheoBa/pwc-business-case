@@ -9,6 +9,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 DATA_DIR = Path(__file__).parent.parent / "data"
 CHROMA_DIR = DATA_DIR / "chromadb"
 COLLECTION_NAME = "bmo_mda_2025"
+METADATA_SCHEMA_VERSION = 2
 
 
 def _get_client() -> chromadb.ClientAPI:
@@ -35,12 +36,28 @@ def get_collection() -> chromadb.Collection:
 
 
 def is_indexed() -> bool:
-    """Check if documents have already been indexed."""
+    """Check if documents have already been indexed with current schema."""
     try:
         collection = get_collection()
-        return collection.count() > 0
+        if collection.count() == 0:
+            return False
+        # Verify schema version by checking a sample document's metadata
+        sample = collection.peek(limit=1)
+        if sample and sample["metadatas"] and sample["metadatas"][0]:
+            meta = sample["metadatas"][0]
+            return meta.get("_schema_version") == METADATA_SCHEMA_VERSION
+        return False
     except Exception:
         return False
+
+
+def reset_collection() -> None:
+    """Delete and recreate the collection (for schema migration)."""
+    client = _get_client()
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+    except Exception:
+        pass
 
 
 def index_documents(chunks: list[dict], progress_callback=None) -> int:
@@ -53,9 +70,13 @@ def index_documents(chunks: list[dict], progress_callback=None) -> int:
     Returns:
         Number of chunks indexed
     """
+    # Reset collection if schema version mismatch
+    if not is_indexed():
+        reset_collection()
+
     collection = get_collection()
 
-    # Skip if already indexed
+    # Skip if already indexed with current schema
     if collection.count() > 0:
         return collection.count()
 
@@ -71,8 +92,13 @@ def index_documents(chunks: list[dict], progress_callback=None) -> int:
         metadatas = [
             {
                 "heading": c["heading"],
-                "content_type": c["content_type"],
+                "heading_top": c.get("heading_top", c["heading"].split(" > ")[0]),
+                "heading_sub": c.get("heading_sub", c["heading"].split(" > ")[-1] if " > " in c["heading"] else ""),
+                "chunk_type": c.get("chunk_type", c.get("content_type", "text")),
                 "page_number": c["page_number"],
+                "source_file": c.get("source_file", ""),
+                "time_period_str": c.get("time_period_str", ""),
+                "_schema_version": METADATA_SCHEMA_VERSION,
             }
             for c in batch
         ]
@@ -88,7 +114,8 @@ def index_documents(chunks: list[dict], progress_callback=None) -> int:
 def query(
     text: str,
     heading_filter: str | None = None,
-    content_type_filter: str | None = None,
+    chunk_type_filter: str | None = None,
+    time_period_filter: str | None = None,
     top_k: int = 5,
 ) -> list[dict]:
     """Query the vector store for relevant chunks.
@@ -96,11 +123,13 @@ def query(
     Args:
         text: Query text
         heading_filter: Optional heading prefix to filter results
-        content_type_filter: Optional content type filter ("text", "table", "image")
+        chunk_type_filter: Optional chunk type filter ("text", "table", "list", "image", "chart_caption")
+        time_period_filter: Optional time period filter (e.g., "Q3 2023", "FY2025")
         top_k: Number of results to return
 
     Returns:
-        List of dicts with keys: id, text, heading, content_type, page_number, distance
+        List of dicts with keys: id, text, heading, heading_top, heading_sub,
+        chunk_type, page_number, source_file, time_period_str, distance
     """
     collection = get_collection()
 
@@ -113,8 +142,10 @@ def query(
 
     if heading_filter:
         conditions.append({"heading": {"$contains": heading_filter}})
-    if content_type_filter:
-        conditions.append({"content_type": content_type_filter})
+    if chunk_type_filter:
+        conditions.append({"chunk_type": chunk_type_filter})
+    if time_period_filter:
+        conditions.append({"time_period_str": {"$contains": time_period_filter}})
 
     if len(conditions) == 1:
         where = conditions[0]
@@ -138,13 +169,18 @@ def query(
     formatted = []
     if results and results["ids"] and results["ids"][0]:
         for i, doc_id in enumerate(results["ids"][0]):
+            meta = results["metadatas"][0][i]
             formatted.append(
                 {
                     "id": doc_id,
                     "text": results["documents"][0][i],
-                    "heading": results["metadatas"][0][i]["heading"],
-                    "content_type": results["metadatas"][0][i]["content_type"],
-                    "page_number": results["metadatas"][0][i]["page_number"],
+                    "heading": meta.get("heading", ""),
+                    "heading_top": meta.get("heading_top", ""),
+                    "heading_sub": meta.get("heading_sub", ""),
+                    "chunk_type": meta.get("chunk_type", meta.get("content_type", "text")),
+                    "page_number": meta.get("page_number", 0),
+                    "source_file": meta.get("source_file", ""),
+                    "time_period_str": meta.get("time_period_str", ""),
                     "distance": results["distances"][0][i] if results.get("distances") else None,
                 }
             )
