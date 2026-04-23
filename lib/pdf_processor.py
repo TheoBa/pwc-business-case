@@ -7,8 +7,12 @@ and segments content into tagged chunks with rich metadata for vector indexing.
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
+
+# Suppress noisy pdfminer color-space warnings
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 import requests
 from unstructured.partition.pdf import partition_pdf
@@ -29,7 +33,7 @@ CHUNKS_CACHE_PATH = DATA_DIR / "chunks.json"
 SOURCE_FILE = "bmo_ar2025_MDA.pdf"
 
 # Schema version — bump this to force re-index when metadata schema changes
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # Minimum chunk length to avoid noise
 MIN_CHUNK_LENGTH = 50
@@ -108,12 +112,8 @@ def _map_element_type(element) -> str:
     """Map an Unstructured element to our chunk_type schema."""
     if isinstance(element, Table):
         return "table"
-    elif isinstance(element, ListItem):
-        return "list"
-    elif isinstance(element, Image):
+    elif isinstance(element, (Image, FigureCaption)):
         return "image"
-    elif isinstance(element, FigureCaption):
-        return "chart_caption"
     else:
         return "text"
 
@@ -176,8 +176,9 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
     # Use Unstructured.io to partition the PDF with layout detection
     elements = partition_pdf(
         filename=str(pdf_path),
-        strategy="fast",
+        strategy="hi_res",
         include_page_breaks=False,
+        infer_table_structure=True,
     )
 
     chunks = []
@@ -200,9 +201,9 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
             heading_sub = heading_path.split(" > ")[-1] if " > " in heading_path else ""
             time_periods = _extract_time_periods(text_buffer)
 
-            for piece in _split_long_chunk(text_buffer.strip()):
+            for idx, piece in enumerate(_split_long_chunk(text_buffer.strip())):
                 chunk_id = hashlib.md5(
-                    f"{heading_path}:{buffer_page}:{piece[:50]}".encode()
+                    f"{heading_path}:{buffer_page}:{idx}:{piece}".encode()
                 ).hexdigest()
                 chunks.append({
                     "id": chunk_id,
@@ -258,7 +259,7 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
             time_periods = _extract_time_periods(display_text)
 
             chunk_id = hashlib.md5(
-                f"{chunk_type}:{heading_path}:{page_num}:{display_text[:50]}".encode()
+                f"{chunk_type}:{heading_path}:{page_num}:{display_text}".encode()
             ).hexdigest()
             chunks.append({
                 "id": chunk_id,
@@ -273,35 +274,8 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
                 "_schema_version": SCHEMA_VERSION,
             })
 
-        elif isinstance(element, ListItem):
-            _flush_buffer()
-
-            heading_path = current_heading
-            if current_subheading:
-                heading_path = f"{current_heading} > {current_subheading}"
-
-            heading_top = heading_path.split(" > ")[0]
-            heading_sub = heading_path.split(" > ")[-1] if " > " in heading_path else ""
-            time_periods = _extract_time_periods(element_text)
-
-            chunk_id = hashlib.md5(
-                f"list:{heading_path}:{page_num}:{element_text[:50]}".encode()
-            ).hexdigest()
-            chunks.append({
-                "id": chunk_id,
-                "text": element_text,
-                "source_file": SOURCE_FILE,
-                "page_number": page_num,
-                "chunk_type": "list",
-                "heading": heading_path,
-                "heading_top": heading_top,
-                "heading_sub": heading_sub,
-                "time_period_str": ",".join(time_periods),
-                "_schema_version": SCHEMA_VERSION,
-            })
-
         else:
-            # NarrativeText and other text elements — buffer them
+            # NarrativeText, ListItem, and other text elements — buffer them
             buffer_page = page_num
             text_buffer += " " + element_text
 

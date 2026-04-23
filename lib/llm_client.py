@@ -138,7 +138,7 @@ def plan_query(question: str, chunks: list[dict] | None = None) -> dict:
 
     headings = get_headings(chunks) if chunks else []
     time_periods = get_all_time_periods(chunks) if chunks else []
-    chunk_types = ["text", "table", "list", "image", "chart_caption"]
+    chunk_types = ["text", "table", "image"]
 
     prompt = QUERY_PLAN_PROMPT.format(
         question=question,
@@ -217,6 +217,14 @@ def stream_rag_response(
         time_period_filter=time_period_filter,
         top_k=top_k,
     )
+
+    # Fallback: if filters returned too few results, retry without LLM-extracted filters
+    if len(results) < 2 and (chunk_type_filter or time_period_filter or (effective_heading and not heading_filter)):
+        results = vector_store.query(
+            text=search_text,
+            heading_filter=heading_filter,  # keep only the manual sidebar filter
+            top_k=top_k,
+        )
 
     context = _format_context(results) if results else "No relevant context found in the document."
 

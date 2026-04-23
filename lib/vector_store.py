@@ -82,6 +82,15 @@ def index_documents(chunks: list[dict], progress_callback=None) -> int:
 
     # Index in batches to avoid memory issues
     batch_size = 100
+
+    # Deduplicate chunks by ID (keep first occurrence)
+    seen_ids: set[str] = set()
+    deduped_chunks: list[dict] = []
+    for c in chunks:
+        if c["id"] not in seen_ids:
+            seen_ids.add(c["id"])
+            deduped_chunks.append(c)
+    chunks = deduped_chunks
     total = len(chunks)
 
     for i in range(0, total, batch_size):
