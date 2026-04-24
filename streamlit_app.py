@@ -23,7 +23,7 @@ page = st.navigation(
         ),
         st.Page(
             "app_pages/conclusion.py",
-            title="Conclusion",
+            title="Architecture",
             icon=":material/architecture:",
         ),
     ],

@@ -176,7 +176,7 @@ def extract_chunks(pdf_path: Path | None = None) -> list[dict]:
     # Use Unstructured.io to partition the PDF with layout detection
     elements = partition_pdf(
         filename=str(pdf_path),
-        strategy="hi_res",
+        strategy="hi_res", # use `fast` or `hi_res`
         include_page_breaks=False,
         infer_table_structure=True,
     )
